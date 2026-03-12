@@ -1,9 +1,9 @@
-// Hayase Anilibria Extension v1.4 — 2026, используем /anime/torrents + клиентский поиск
+// Hayase Anilibria Extension v1.5 — цикл по страницам /anime/torrents + точный клиентский поиск
 
 export default {
   async test() {
     try {
-      const res = await fetch('https://anilibria.top/api/v1/anime/torrents');
+      const res = await fetch('https://anilibria.top/api/v1/anime/torrents?page=1');
       console.log('[Anilibria TEST] Status:', res.status);
       return res.ok;
     } catch (err) {
@@ -27,89 +27,88 @@ async function searchTorrents(query, isBatch = false) {
     return [];
   }
 
-  console.log('[Anilibria] Названия из Hayase:', query.titles);
+  console.log('[Anilibria] Названия:', query.titles);
   console.log('[Anilibria] Эпизод:', query.episode ?? 'не указан');
 
-  // Предпочитаем русское название
-  const preferredTitle = query.titles.find(t => /[\u0400-\u04FFёЁ]/.test(t)) || query.titles[0] || '';
-  const searchLower = preferredTitle.toLowerCase().trim();
+  // Русское название в lowercase для поиска
+  const rusTitle = query.titles.find(t => /[\u0400-\u04FFёЁ]/.test(t)) || query.titles[0] || '';
+  const searchLower = rusTitle.toLowerCase().trim().replace(/[:?!\.,]/g, ''); // убираем пунктуацию
 
-  console.log('[Anilibria] Фильтруем по (русскому, lowercase):', searchLower);
+  console.log('[Anilibria] Ищем по (очищенному русскому):', searchLower);
 
-  try {
-    // Берём первую страницу (25 элементов) — для теста достаточно, можно потом пагинацию добавить
-    const url = 'https://anilibria.top/api/v1/anime/torrents?page=1';
-    const res = await fetch(url);
+  const results = [];
+  const maxPages = 5; // 5 страниц × 25 = 125 элементов — для теста; можно увеличить до 10–20
 
-    if (!res.ok) {
-      console.log('[Anilibria] Статус не OK:', res.status);
-      return [];
-    }
+  for (let page = 1; page <= maxPages; page++) {
+    try {
+      const url = `https://anilibria.top/api/v1/anime/torrents?page=${page}`;
+      const res = await fetch(url);
 
-    const data = await res.json();
-    console.log('[Anilibria] Получено элементов:', data?.data?.length || 0);
-
-    if (!data?.data?.length) {
-      console.log('[Anilibria] data пустая');
-      return [];
-    }
-
-    const results = [];
-
-    for (const item of data.data) {
-      const release = item.release || {};
-      const names = release.name || {};
-      const mainName = (names.main || '').toLowerCase();
-      const engName = (names.english || '').toLowerCase();
-      const alias = (release.alias || '').toLowerCase();
-
-      // Проверяем совпадение по названию или alias
-      const matchesName = mainName.includes(searchLower) ||
-                          engName.includes(searchLower) ||
-                          alias.includes(searchLower.replace(/ /g, '-')) ||
-                          searchLower.includes(alias);
-
-      if (!matchesName) continue;
-
-      console.log('[Anilibria] Совпадение:', mainName || engName || alias);
-
-      const targetEp = Number(query.episode) || 1;
-      const epDesc = item.description || ''; // "1-9" или "12"
-
-      // Мягкая проверка эпизода
-      const matchesEp = !query.episode ||
-        epDesc.includes(targetEp.toString()) ||
-        epDesc.includes(`-${targetEp}`) ||
-        epDesc.includes(`${targetEp}-`) ||
-        (isBatch && epDesc.includes('-') && epDesc.split('-').length > 1);
-
-      if (matchesEp) {
-        const magnet = item.magnet;
-        const link = magnet || null; // torrent-файл не всегда есть, но magnet надёжнее
-
-        if (!link) continue;
-
-        results.push({
-          title: `${names.main || names.english || release.alias || '—'} | ${item.quality?.value || '?'} | ${epDesc || item.series || '—'}`,
-          link,
-          id: item.id || item.hash,
-          seeders: item.seeders || 0,
-          leechers: item.leechers || 0,
-          downloads: item.completed_times || 0,
-          accuracy: 'medium',
-          hash: item.hash,
-          size: item.size || 0,
-          date: item.created_at ? new Date(item.created_at) : null,
-          type: isBatch ? 'batch' : ''
-        });
+      if (!res.ok) {
+        console.log('[Anilibria] Страница', page, 'не OK:', res.status);
+        break;
       }
+
+      const data = await res.json();
+      const items = data?.data || [];
+
+      console.log('[Anilibria] Страница', page, 'элементов:', items.length);
+
+      for (const item of items) {
+        const release = item.release || {};
+        const names = release.name || {};
+        const main = (names.main || '').toLowerCase().replace(/[:?!\.,]/g, '');
+        const eng = (names.english || '').toLowerCase().replace(/[:?!\.,]/g, '');
+        const alias = (release.alias || '').toLowerCase();
+
+        // Матч: если хотя бы часть названия совпадает
+        const matches = main.includes(searchLower) ||
+                        eng.includes(searchLower) ||
+                        searchLower.includes(main) ||
+                        alias.includes(searchLower.replace(/ /g, '-')) ||
+                        main.includes('демонов') && searchLower.includes('демон'); // для Demon Slayer вариаций
+
+        if (!matches) continue;
+
+        console.log('[Anilibria] Совпадение на странице', page, ':', names.main || names.english || alias);
+
+        const targetEp = Number(query.episode) || 1;
+        const epDesc = item.description || ''; // "1-9", "12" и т.д.
+
+        const matchesEp = !query.episode ||
+          epDesc.includes(targetEp.toString()) ||
+          epDesc.includes(`-${targetEp}`) ||
+          epDesc.includes(`${targetEp}-`) ||
+          epDesc.includes(`[${targetEp}]`) ||
+          (isBatch && epDesc.includes('-') && epDesc.split('-')[1] > epDesc.split('-')[0]);
+
+        if (matchesEp) {
+          const magnet = item.magnet;
+          if (!magnet) continue;
+
+          results.push({
+            title: `${names.main || names.english || release.alias || '—'} | ${item.quality?.value || '?'} | ${epDesc || '—'}`,
+            link: magnet,
+            id: item.id || item.hash,
+            seeders: item.seeders || 0,
+            leechers: item.leechers || 0,
+            downloads: item.completed_times || 0,
+            accuracy: 'medium',
+            hash: item.hash,
+            size: item.size || 0,
+            date: item.created_at ? new Date(item.created_at) : null,
+            type: isBatch ? 'batch' : ''
+          });
+        }
+      }
+
+      if (items.length < 25) break; // последняя страница
+    } catch (err) {
+      console.error('[Anilibria] Ошибка на странице', page, ':', err.message);
+      break;
     }
-
-    console.log('[Anilibria] Найдено подходящих торрентов:', results.length);
-    return results;
-
-  } catch (err) {
-    console.error('[Anilibria] Ошибка:', err.name, err.message);
-    return [];
   }
+
+  console.log('[Anilibria] Итого подходящих торрентов:', results.length);
+  return results;
 }
