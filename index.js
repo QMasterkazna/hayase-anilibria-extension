@@ -1,4 +1,4 @@
-// Hayase Anilibria Extension v1.5 — цикл по страницам /anime/torrents + точный клиентский поиск
+// Hayase Anilibria Extension v1.7 — точный матч названий, приоритет eng/romaji, без ложных "демон"
 
 export default {
   async test() {
@@ -22,72 +22,75 @@ export default {
 async function searchTorrents(query, isBatch = false) {
   const fetch = query.fetch;
 
-  if (!query.titles?.length) {
-    console.log('[Anilibria] Нет названий');
-    return [];
-  }
+  if (!query.titles?.length) return [];
 
-  console.log('[Anilibria] Названия:', query.titles);
+  console.log('[Anilibria] Названия из Hayase:', query.titles);
   console.log('[Anilibria] Эпизод:', query.episode ?? 'не указан');
 
-  // Русское название в lowercase для поиска
-  const rusTitle = query.titles.find(t => /[\u0400-\u04FFёЁ]/.test(t)) || query.titles[0] || '';
-  const searchLower = rusTitle.toLowerCase().trim().replace(/[:?!\.,]/g, ''); // убираем пунктуацию
-
-  console.log('[Anilibria] Ищем по (очищенному русскому):', searchLower);
+  // Кандидаты на поиск: русское первыми, потом eng/romaji
+  const candidates = [
+    ...query.titles.filter(t => /[\u0400-\u04FFёЁ]/.test(t)).map(t => t.toLowerCase().trim().replace(/[:?!\.,]/g, '')),
+    ...query.titles.map(t => t.toLowerCase().trim().replace(/[:?!\.,]/g, ''))
+  ];
 
   const results = [];
-  const maxPages = 5; // 5 страниц × 25 = 125 элементов — для теста; можно увеличить до 10–20
+  const maxPages = 8;
 
   for (let page = 1; page <= maxPages; page++) {
     try {
       const url = `https://anilibria.top/api/v1/anime/torrents?page=${page}`;
       const res = await fetch(url);
-
-      if (!res.ok) {
-        console.log('[Anilibria] Страница', page, 'не OK:', res.status);
-        break;
-      }
+      if (!res.ok) break;
 
       const data = await res.json();
       const items = data?.data || [];
 
-      console.log('[Anilibria] Страница', page, 'элементов:', items.length);
-
       for (const item of items) {
         const release = item.release || {};
         const names = release.name || {};
-        const main = (names.main || '').toLowerCase().replace(/[:?!\.,]/g, '');
-        const eng = (names.english || '').toLowerCase().replace(/[:?!\.,]/g, '');
-        const alias = (release.alias || '').toLowerCase();
+        const mainLower = (names.main || '').toLowerCase().replace(/[:?!\.,]/g, '');
+        const engLower = (names.english || '').toLowerCase().replace(/[:?!\.,]/g, '');
+        const aliasLower = (release.alias || '').toLowerCase();
 
-        // Матч: если хотя бы часть названия совпадает
-        const matches = main.includes(searchLower) ||
-                        eng.includes(searchLower) ||
-                        searchLower.includes(main) ||
-                        alias.includes(searchLower.replace(/ /g, '-')) ||
-                        main.includes('демонов') && searchLower.includes('демон'); // для Demon Slayer вариаций
+        let bestMatchScore = 0;
+        let matchedTerm = '';
 
-        if (!matches) continue;
+        for (const term of candidates) {
+          if (term.length < 5) continue; // игнорим короткие
 
-        console.log('[Anilibria] Совпадение на странице', page, ':', names.main || names.english || alias);
+          // Точное совпадение или начало слова
+          let score = 0;
+          if (mainLower === term || engLower === term || aliasLower === term) score = 10;
+          else if (mainLower.startsWith(term) || engLower.startsWith(term)) score = 8;
+          else if (mainLower.includes(term) || engLower.includes(term)) score = 5;
+          else if (term.includes('демон') && (mainLower.includes('демон') || engLower.includes('demon'))) score = 3; // слабый для Demon Slayer вариаций
+          else if (aliasLower.includes(term.replace(/ /g, '-'))) score = 4;
+
+          if (score > bestMatchScore) {
+            bestMatchScore = score;
+            matchedTerm = term;
+          }
+        }
+
+        if (bestMatchScore < 5) continue; // слишком слабый матч — пропускаем
+
+        console.log('[Anilibria] Совпадение (score ' + bestMatchScore + ') на странице', page, ':', names.main || names.english || release.alias, 'по термину:', matchedTerm);
 
         const targetEp = Number(query.episode) || 1;
-        const epDesc = item.description || ''; // "1-9", "12" и т.д.
+        const epDesc = item.description || '';
 
         const matchesEp = !query.episode ||
           epDesc.includes(targetEp.toString()) ||
           epDesc.includes(`-${targetEp}`) ||
           epDesc.includes(`${targetEp}-`) ||
-          epDesc.includes(`[${targetEp}]`) ||
-          (isBatch && epDesc.includes('-') && epDesc.split('-')[1] > epDesc.split('-')[0]);
+          (isBatch && epDesc.includes('-') && epDesc.split('-').length > 1);
 
-        if (matchesEp) {
+        if (matchesEp && (item.seeders || 0) >= 5) {
           const magnet = item.magnet;
           if (!magnet) continue;
 
           results.push({
-            title: `${names.main || names.english || release.alias || '—'} | ${item.quality?.value || '?'} | ${epDesc || '—'}`,
+            title: `${names.main || names.english || release.alias || '—'} | ${item.quality?.value || '?'} | ${epDesc || '—'} (seeders: ${item.seeders || 0})`,
             link: magnet,
             id: item.id || item.hash,
             seeders: item.seeders || 0,
@@ -97,18 +100,21 @@ async function searchTorrents(query, isBatch = false) {
             hash: item.hash,
             size: item.size || 0,
             date: item.created_at ? new Date(item.created_at) : null,
-            type: isBatch ? 'batch' : ''
+            type: isBatch ? 'batch' : '',
+            score: bestMatchScore  // для внутренней сортировки
           });
         }
       }
 
-      if (items.length < 25) break; // последняя страница
+      if (items.length < 25) break;
     } catch (err) {
-      console.error('[Anilibria] Ошибка на странице', page, ':', err.message);
       break;
     }
   }
 
-  console.log('[Anilibria] Итого подходящих торрентов:', results.length);
+  // Сортировка: сначала по score descending, потом по seeders descending
+  results.sort((a, b) => b.score - a.score || b.seeders - a.seeders);
+
+  console.log('[Anilibria] Итого подходящих (с seeders >=5):', results.length);
   return results;
 }
