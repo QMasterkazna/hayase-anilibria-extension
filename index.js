@@ -1,4 +1,4 @@
-// Hayase Anilibria Extension v2.5 — поиск релиза + избегание фильмов + приоритет сериалу
+// Hayase Anilibria Extension v2.4 — поиск релиза + торренты по /release/{id} + умный выбор
 
 export default {
   async test() {
@@ -25,14 +25,12 @@ async function searchTorrents(query, isBatch = false) {
   console.log('[Anilibria] Названия:', query.titles);
   console.log('[Anilibria] Эпизод:', query.episode ?? 'не указан');
 
-  // Добавляем точное название сериала как fallback
-  const forcedTerms = ['Клинок, рассекающий демонов', 'Kimetsu no Yaiba'];
-
-  const candidates = [
-    ...query.titles.filter(t => /[\u0400-\u04FFёЁ]/.test(t) && t.toLowerCase().includes('клинок')), // русское полное первыми
-    ...query.titles,
-    ...forcedTerms // если ничего не нашлось — принудительно ищем сериал
-  ];
+  // Все кандидаты, но приоритет "Клинок..." и "Kimetsu no Yaiba"
+  let candidates = query.titles;
+  // Добавляем вручную точные варианты, если не нашлось
+  if (!candidates.some(t => t.toLowerCase().includes('клинок') || t.toLowerCase().includes('kimetsu'))) {
+    candidates = [...candidates, 'Клинок, рассекающий демонов', 'Kimetsu no Yaiba'];
+  }
 
   let releaseId = null;
   let releaseName = '';
@@ -52,17 +50,20 @@ async function searchTorrents(query, isBatch = false) {
 
       const data = await res.json();
       if (data?.length > 0) {
-        // Ищем НЕ фильм в результатах
-        let rel = data.find(r => r.type?.value !== 'MOVIE' && r.type?.value !== 'ONA' && r.type?.value !== 'SPECIAL');
-        if (!rel) rel = data[0]; // если только фильмы — берём первый
-
+        const rel = data[0];
         releaseId = rel.id;
         releaseName = rel.name?.main || rel.name?.english || rel.alias || clean;
         releaseAlias = rel.alias || '';
         isMovie = rel.type?.value === 'MOVIE';
-        console.log('[Anilibria] Выбран релиз → id:', releaseId, 'alias:', releaseAlias, 'name:', releaseName, 'type:', rel.type?.value || 'unknown');
+        console.log('[Anilibria] Нашёл → id:', releaseId, 'alias:', releaseAlias, 'name:', releaseName, 'type:', rel.type?.value || 'unknown');
 
-        if (!isMovie) break; // нашли сериал — выходим
+        // Если фильм и запрос не на фильм — ищем дальше
+        if (isMovie && !query.titles.some(t => t.toLowerCase().includes('movie') || t.toLowerCase().includes('фильм'))) {
+          console.log('[Anilibria] Это фильм, ищем дальше...');
+          continue;
+        }
+
+        break;
       }
     } catch (err) {
       console.log('[Anilibria] Ошибка по "' + clean + '":', err.message);
@@ -93,6 +94,7 @@ async function searchTorrents(query, isBatch = false) {
     for (const tor of torrents) {
       const epDesc = tor.description || tor.series || '—';
 
+      // Мягкая проверка эпизода (берём всё, если batch или эпизод не указан)
       let matchesEp = true;
       if (query.episode) {
         matchesEp = epDesc.includes(targetEp.toString()) ||
@@ -132,6 +134,8 @@ async function searchTorrents(query, isBatch = false) {
   console.log('[Anilibria] Итого:', results.length);
   if (results.length > 0) {
     console.log('[Anilibria] Торренты:\n' + results.map(r => r.title).join('\n'));
+  } else {
+    console.log('[Anilibria] Торренты не подошли по эпизоду — попробуй без эпизода или другой тайтл');
   }
 
   return results;
