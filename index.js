@@ -1,4 +1,4 @@
-// Hayase Anilibria Extension v2.3 — поиск релиза → торренты по /release/{id}
+// Hayase Anilibria Extension v2.5 — поиск релиза + избегание фильмов + приоритет сериалу
 
 export default {
   async test() {
@@ -20,30 +20,30 @@ export default {
 async function searchTorrents(query, isBatch = false) {
   const fetch = query.fetch;
 
-  if (!query.titles?.length) {
-    console.log('[Anilibria] Нет названий для поиска');
-    return [];
-  }
+  if (!query.titles?.length) return [];
 
-  console.log('[Anilibria] Названия из Hayase:', query.titles);
+  console.log('[Anilibria] Названия:', query.titles);
   console.log('[Anilibria] Эпизод:', query.episode ?? 'не указан');
 
-  // Предпочитаем русское название → английское/ромадзи
+  // Добавляем точное название сериала как fallback
+  const forcedTerms = ['Клинок, рассекающий демонов', 'Kimetsu no Yaiba'];
+
   const candidates = [
-    ...query.titles.filter(t => /[\u0400-\u04FFёЁ]/.test(t)),
-    ...query.titles
+    ...query.titles.filter(t => /[\u0400-\u04FFёЁ]/.test(t) && t.toLowerCase().includes('клинок')), // русское полное первыми
+    ...query.titles,
+    ...forcedTerms // если ничего не нашлось — принудительно ищем сериал
   ];
 
   let releaseId = null;
   let releaseName = '';
   let releaseAlias = '';
+  let isMovie = false;
 
-  // Ищем релиз по одному из названий
   for (const term of candidates) {
     if (!term?.trim()) continue;
 
     const clean = term.trim().replace(/[:?!\.,]/g, '');
-    console.log('[Anilibria] Пробуем поиск релиза по:', clean);
+    console.log('[Anilibria] Поиск по:', clean);
 
     try {
       const url = `https://anilibria.top/api/v1/app/search/releases?query=${encodeURIComponent(clean)}`;
@@ -52,58 +52,56 @@ async function searchTorrents(query, isBatch = false) {
 
       const data = await res.json();
       if (data?.length > 0) {
-        const rel = data[0];
+        // Ищем НЕ фильм в результатах
+        let rel = data.find(r => r.type?.value !== 'MOVIE' && r.type?.value !== 'ONA' && r.type?.value !== 'SPECIAL');
+        if (!rel) rel = data[0]; // если только фильмы — берём первый
+
         releaseId = rel.id;
         releaseName = rel.name?.main || rel.name?.english || rel.alias || clean;
         releaseAlias = rel.alias || '';
-        console.log('[Anilibria] Нашёл релиз → id:', releaseId, 'alias:', releaseAlias, 'name:', releaseName);
-        break;
+        isMovie = rel.type?.value === 'MOVIE';
+        console.log('[Anilibria] Выбран релиз → id:', releaseId, 'alias:', releaseAlias, 'name:', releaseName, 'type:', rel.type?.value || 'unknown');
+
+        if (!isMovie) break; // нашли сериал — выходим
       }
     } catch (err) {
-      console.log('[Anilibria] Ошибка при поиске по "' + clean + '":', err.message);
+      console.log('[Anilibria] Ошибка по "' + clean + '":', err.message);
     }
   }
 
   if (!releaseId) {
-    console.log('[Anilibria] Ни один релиз не найден');
+    console.log('[Anilibria] Релиз не найден');
     return [];
   }
 
-  // Получаем торренты именно этого релиза
   const results = [];
 
   try {
     const torrentsUrl = `https://anilibria.top/api/v1/anime/torrents/release/${releaseId}`;
     const res = await fetch(torrentsUrl);
     if (!res.ok) {
-      console.log('[Anilibria] Торренты не получены, статус:', res.status);
+      console.log('[Anilibria] Торренты ошибка:', res.status);
       return [];
     }
 
-    const torrentsData = await res.json();
-    const torrents = torrentsData || [];  // массив объектов
+    const torrents = await res.json() || [];
 
-    console.log('[Anilibria] Получено торрентов для релиза:', torrents.length);
+    console.log('[Anilibria] Торрентов:', torrents.length);
 
     const targetEp = Number(query.episode) || 1;
 
     for (const tor of torrents) {
       const epDesc = tor.description || tor.series || '—';
 
-      // Проверка эпизода (мягкая)
-      let matchesEp = !query.episode; // если эпизод не указан — берём все
+      let matchesEp = true;
       if (query.episode) {
-        if (epDesc.includes(targetEp.toString()) ||
-            epDesc.includes(`-${targetEp}`) ||
-            epDesc.includes(`${targetEp}-`) ||
-            epDesc.includes(`[${targetEp}]`)) {
-          matchesEp = true;
-        } else if (epDesc.includes('-')) {
-          const [start, end] = epDesc.split('-').map(n => parseInt(n.trim(), 10));
-          if (!isNaN(start) && !isNaN(end) && targetEp >= start && targetEp <= end) {
-            matchesEp = true;
-          }
-        }
+        matchesEp = epDesc.includes(targetEp.toString()) ||
+                    epDesc.includes(`-${targetEp}`) ||
+                    epDesc.includes(`${targetEp}-`) ||
+                    (epDesc.includes('-') && {
+                      const [s, e] = epDesc.split('-').map(Number);
+                      return !isNaN(s) && !isNaN(e) && targetEp >= s && targetEp <= e;
+                    }());
       }
 
       if (matchesEp) {
@@ -111,7 +109,7 @@ async function searchTorrents(query, isBatch = false) {
         if (!magnet || !magnet.startsWith('magnet:?')) continue;
 
         results.push({
-          title: `${releaseName} | ${tor.quality?.value || tor.type?.description || '?'} | ${epDesc} (seeders: ${tor.seeders || 0})`,
+          title: `${releaseName} | ${tor.quality?.value || '?'} | ${epDesc} (seeders: ${tor.seeders || 0})`,
           link: magnet,
           id: tor.id || tor.hash,
           seeders: tor.seeders || 0,
@@ -126,15 +124,14 @@ async function searchTorrents(query, isBatch = false) {
       }
     }
   } catch (err) {
-    console.error('[Anilibria] Ошибка при получении торрентов по id:', err.message);
+    console.error('[Anilibria] Ошибка торрентов:', err.message);
   }
 
-  // Сортировка по seeders descending
   results.sort((a, b) => b.seeders - a.seeders);
 
-  console.log('[Anilibria] Итого подходящих торрентов:', results.length);
+  console.log('[Anilibria] Итого:', results.length);
   if (results.length > 0) {
-    console.log('[Anilibria] Список:\n' + results.map(r => r.title).join('\n'));
+    console.log('[Anilibria] Торренты:\n' + results.map(r => r.title).join('\n'));
   }
 
   return results;
